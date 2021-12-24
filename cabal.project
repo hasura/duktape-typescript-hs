@@ -1,0 +1,8 @@
+packages: .
+
+-- Had to tweak some things for now, but plan would be for us to take over 
+-- maintainership of these bindings, or a fork on hackage:
+source-repository-package
+  type: git
+  location: https://github.com/hasura/hs-duktape.git
+  tag: e1a47b8802d12cd221eead508c5b4d9ccd65feb4
