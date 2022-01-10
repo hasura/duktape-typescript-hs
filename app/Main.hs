@@ -9,18 +9,19 @@ import Scripting.Duktape
 import Control.Monad
 import Data.Aeson
 import GHC.Generics
-
+import Control.Exception
 
 -- | Initialise duktape with the enironment we want for client code. In this
 -- case:
 --
 --   - module imports via 'require'
 --   - console.log() etc.
+--   - other shims needed in the TS compiler:
 createOurFancyDuktapeCtx = do
   Just ctx <- createDuktapeCtx  -- TODO in duktape: throw here;
-  exposeFnDuktape ctx Nothing "hs_modsearch" hs_modsearch >>= \case
-    Right () -> return ()
-    Left err -> error err
+  -- for the TypeScript compiler:
+  exposeFnDuktape ctx Nothing "hs_modsearch" hs_modsearch >>= throwLeft  -- TODO in duktape: throw here (probably? what are failure modes if global object?)
+  exposeFnDuktape ctx Nothing "hs_ts_getSourceFile" hs_ts_getSourceFile >>= throwLeft
 
   setupShims ctx
 
@@ -29,7 +30,7 @@ createOurFancyDuktapeCtx = do
     -- Here we specify in haskell how we should resolve module imports in JS
     hs_modsearch :: T.Text -> IO T.Text
     hs_modsearch = \case
-      -- We could just read the file from the name client code provided, but this
+      -- We could just read the files from the name client code provided, but this
       -- demonstrates whitelisting of modules:
       "typescript" -> do
           typescript_js <- T.readFile "typescript_vendored/typescript.js"
@@ -38,25 +39,41 @@ createOurFancyDuktapeCtx = do
             -- module by exporting it, so we do that here
             -- TODO is this the right way to do it, or am I dumb?
             typescript_js <> ";\n module.exports = ts;"
+      _ -> error "unexpected JS import"
+
+    -- A host language shim to power getSourceFile in our TS compiler's
+    -- CompilerHost implementation:
+    hs_ts_getSourceFile :: T.Text -> IO T.Text
+    hs_ts_getSourceFile = \case
+      -- TS type declarations for ES5 std lib:
+      "lib.es5.d.ts" -> T.readFile "typescript_vendored/lib.es5.d.ts"
+      _ -> error "unexpected getSourceFile"
 
     -- Duktape doesn't implement anything that might require STDOUT/IN. Instead you
     -- implement this stuff in the host language.
     setupShims :: DuktapeCtx -> IO ()
     setupShims ctx = do
         ------ `console`
-        evalDuktape ctx "var console = {}"
+        evalDuktape ctx "var console = {}" -- TODO in duktape: maybe exposeFnDuktape should do this itself if undefined?
         -- In production we would collect these logs for each individual user,
         -- storing them in the DB, or perhaps streaming them to the console for a
         -- REPL view:
-        exposeFnDuktape ctx (Just "console") "log" (\s -> putStrLn s >> return True) >>= \case -- TODO in duktape: fix overlapping instance
-          Right () -> return ()
-          Left err -> error err
+        -- TODO properly mimic console.log API:
+        exposeFnDuktape ctx (Just "console") "log" (\s -> putStrLn s >> return True) >>= -- TODO in duktape: fix overlapping instance
+          throwLeft
+
+-- dumb helper
+throwLeft :: Monad m=> Either String a -> m a
+throwLeft = either error return
+
 
 main :: IO ()
 main = do
-  transpilerCtx <- createOurFancyDuktapeCtx
-
+  -- --------------------------------------------------------------------------
+  -- This section is executed at action-creation time (e.g. in the API that
+  -- powers a console editor pane for adding typescript actions)
   putStrLn "*** Loading our typescript transpiler, which require()'s the typescript API JS"
+  transpilerCtx <- createOurFancyDuktapeCtx
   loadTypescriptCompiler transpilerCtx
 
   putStrLn "*** Transpiling a typescript program to ES5 JS, using our new transpiler"
@@ -65,14 +82,19 @@ main = do
   -- take an object of a certain type we expose to client code, and also return
   -- a result of an expected shape (corresponding in some way to the user's
   -- schema, say):
-  -- TODO a top-level 'function' declaration gives an error about missing 'find'...
-  let userActionCodeTS = "const add: number = (x: number, y: number) =>  return x + y"
-  Right (Just transpiledRes) <- callDuktape transpilerCtx Nothing "transpileTypeScript" [String userActionCodeTS]
-  let Success TSTranspileOutput{..} = fromJSON transpiledRes
-  putStrLn $ "    Niiiiiice: " <> T.unpack outputText
+  -- TODO a top-level 'function' declaration gives an error:
+  --        TypeError: undefined not callable (property 'find' of [object Array])
+  -- TODO (re above) understand "eval code" vs "program code": 
+  --      https://github.com/svaarala/duktape/issues/163#issuecomment-89756195 
+  --      Maybe extend duktape bindings, document.
+  -- let userActionCodeTS = "this.add = (x: number, y: number) =>  return x + y"
+  let userActionCodeTS = "this.add = (x: number, y: number): number =>  return x + y"
+  Right (Just transpiledRes) <- callDuktape transpilerCtx Nothing "compileTypeScript" [String userActionCodeTS]  -- TODO in duktape: consider taking [path, to, functionName] instead of (Maybe obj) here and in exposeFnDuktape
 
-  let userActionCodeJS = T.encodeUtf8 outputText
+  let Success TSCompilerOutput{..} = fromJSON transpiledRes
+  putStrLn $ "    Niiiiiice: " <> T.unpack jsCode
 
+  -- --------------------------------------------------------------------------
   -- At this point we imagine we could store the user's transpiled JS text in
   -- the database (to power an action execution in the future), and we might
   -- also compile it into duktape bytecode for fast exection. Or we might just
@@ -83,10 +105,8 @@ main = do
   -- obviously we don't need or necessarily want the client code itself to be
   -- able to compile typescript):
   executorCtx <- createOurFancyDuktapeCtx
-  evalDuktape executorCtx userActionCodeJS >>= \case
-    Left err -> error err
-    Right (Just _val) -> error "We just defined a function here; nothing expected to be returned"
-    Right Nothing -> return ()
+  Right _ <- evalDuktape executorCtx (T.encodeUtf8 jsCode)
+  -- ^ NOTE: this might or might not return a value; not clear if we want to enforce something here.
 
   Right (Just actionRes) <- callDuktape executorCtx Nothing "add" [Number 20, Number 22]
   putStrLn $ "    Holy cow, did it work??: " <> show actionRes
@@ -99,22 +119,40 @@ main = do
     -- haskell compile time, for security and possibly performance. We could
     -- also just store the source string at compile time too, obviously.
     loadTypescriptCompiler ctx = do
-      ts_compiler_js <- B.readFile "ts_transpile.js"
-      -- ts_compiler_js <- B.readFile "ts_compiler.js"
+      ts_compiler_js <- B.readFile "ts_compiler.js"
 
-      -- guard B.isValidUtf8 ts_compiler_js  -- TODO in v0.11
+      -- guard B.isValidUtf8 ts_compiler_js  -- TODO in v0.11 , maybe in evalDuktape directly
 
       evalDuktape ctx ts_compiler_js >>= \case
         Left err -> error err
         Right (Just _val) -> error "We just defined a function here; nothing expected to be returned"
         Right Nothing -> return ()
 
--- | The output of ts.transpileModule, exposed via our transpileTypeScript
-data TSTranspileOutput =
-    TSTranspileOutput {
-      diagnostics :: [String],
-      -- ^ I'm not actually sure what shape this field expects
-      outputText :: T.Text
-    } deriving (Generic)
-instance FromJSON TSTranspileOutput
 
+-- | The output of our compileTypeScript JS function
+data TSCompilerOutput =
+    TSCompilerOutput {
+      diagnostics :: [TSCompilerDiagnostic],
+      jsCode :: T.Text
+    } deriving (Show, Eq, Ord, Generic)
+instance FromJSON TSCompilerOutput
+
+-- | Errors and warnings from the TypeScript compiler
+data TSCompilerDiagnostic =
+    TSCompilerDiagnostic {
+      file :: Maybe T.Text,
+      -- ^ TODO this seems to be "SourceFileObject" for the user's code for now...?
+      start :: Maybe Int,
+      -- ^ Source code location in bytes
+      length :: Maybe Int,
+      -- ^ Source code location span from 'start', in bytes
+      messageText :: T.Text,
+      category :: Int,
+      code :: Int
+      -- NOTE: we drop these for now, which always seem to come back undefined.
+      --       There may be other properties for different error types too
+      -- reportsUnnecessary :: undefined
+      -- reportsDeprecated :: undefined
+      -- relatedInformation: undefined
+    } deriving (Show, Eq, Ord, Generic)
+instance FromJSON TSCompilerDiagnostic

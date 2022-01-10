@@ -5,4 +5,4 @@ packages: .
 source-repository-package
   type: git
   location: https://github.com/hasura/hs-duktape.git
-  tag: e1a47b8802d12cd221eead508c5b4d9ccd65feb4
+  tag: 2ebf728f9dd3c8247f846e6e8fdc824990721244
