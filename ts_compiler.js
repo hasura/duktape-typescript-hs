@@ -13,9 +13,6 @@ function compileTypeScript(code) {
     // We can easily extend this to support multiple "virtual" files.
     const dummyInputFileName  = "test.ts";
     const dummyOutputFileName = "test.js";
-    // NOTE: we target ES5 for duktape:
-    // TODO do we actually want ES5 here instead of Latest? Not sure what this is for:
-    const sourceFile = ts.createSourceFile(dummyInputFileName, code, ts.ScriptTarget.Latest);
     // The compiler will "write out" the compiled JS to this variable, in 'writeFile':
     var outputCode = undefined;
 
@@ -23,14 +20,18 @@ function compileTypeScript(code) {
     // as-needed (since we're compiling from strings in memory):
     var customCompilerHost = {
         getSourceFile: function (name) {
+            var sourceFile;
             console.log("getSourceFile ".concat(name));
             if (name === dummyInputFileName) {
-                return sourceFile;
+                sourceFile = code;  // The code we're trying to compile
             }
             else {
                 // Get any other file contents using a whitelist implemented in haskell:
-                hs_ts_getSourceFile(name);
+                sourceFile = hs_ts_getSourceFile(name);
             }
+            // NOTE: we target ES5 for duktape:
+            // TODO do we actually want ES5 here instead of Latest? Not sure what this is for:
+            return ts.createSourceFile(name, sourceFile, ts.ScriptTarget.Latest);
         },
         writeFile: function (name, data) {
             if (name === dummyOutputFileName) {

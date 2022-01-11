@@ -54,7 +54,7 @@ createOurFancyDuktapeCtx = do
     setupShims :: DuktapeCtx -> IO ()
     setupShims ctx = do
         ------ `console`
-        evalDuktape ctx "var console = {}" -- TODO in duktape: maybe exposeFnDuktape should do this itself if undefined?
+        Right _ <- evalDuktape ctx "var console = {}" -- TODO in duktape: maybe exposeFnDuktape should do this itself if undefined?
         -- In production we would collect these logs for each individual user,
         -- storing them in the DB, or perhaps streaming them to the console for a
         -- REPL view:
@@ -62,9 +62,43 @@ createOurFancyDuktapeCtx = do
         exposeFnDuktape ctx (Just "console") "log" (\s -> putStrLn s >> return True) >>= -- TODO in duktape: fix overlapping instance
           throwLeft
 
--- dumb helper
-throwLeft :: Monad m=> Either String a -> m a
-throwLeft = either error return
+        -- ES6 Polyfills which the transpiled TypeScript API code needs, it seems:
+        -- TODO I actually assumed these artifacts were using the ES5 target
+        --      since things just worked at first, but it seems they actually
+        --      use ES6! So I think we'll need to modify `typescript_vendored/setup.sh`
+        --      to use ES5 and then run `gulp LKG` ourselves and copy the files.
+        Right _ <- evalDuktape ctx $
+            "(function () {" <>
+            "    if (!Array.prototype.find) {" <>
+            "      Object.defineProperty(Array.prototype, 'find', {" <>
+            "        enumerable: false," <>
+            "        configurable: true," <>
+            "        writable: true," <>
+            "        value: function(predicate) {" <>
+            "          if (this == null) {" <>
+            "            throw new TypeError('Array.prototype.find called on null or undefined');" <>
+            "          }" <>
+            "          if (typeof predicate !== 'function') {" <>
+            "            throw new TypeError('predicate must be a function');" <>
+            "          }" <>
+            "          var list = Object(this);" <>
+            "          var length = list.length >>> 0;" <>
+            "          var thisArg = arguments[1];" <>
+            "          var value;" <>
+            "          for (var i = 0; i < length; i++) {" <>
+            "            if (i in list) {" <>
+            "              value = list[i];" <>
+            "              if (predicate.call(thisArg, value, i, list)) {" <>
+            "                return value;" <>
+            "              }" <>
+            "            }" <>
+            "          }" <>
+            "          return undefined;" <>
+            "        }" <>
+            "      });" <>
+            "    }" <>
+            "})();"
+        return ()
 
 
 main :: IO ()
@@ -83,15 +117,20 @@ main = do
   -- a result of an expected shape (corresponding in some way to the user's
   -- schema, say):
   -- TODO a top-level 'function' declaration gives an error:
-  --        TypeError: undefined not callable (property 'find' of [object Array])
+  --        TypeError: undefined not callable (property 'add' of [object global])
   -- TODO (re above) understand "eval code" vs "program code": 
   --      https://github.com/svaarala/duktape/issues/163#issuecomment-89756195 
   --      Maybe extend duktape bindings, document.
-  -- let userActionCodeTS = "this.add = (x: number, y: number) =>  return x + y"
-  let userActionCodeTS = "this.add = (x: number, y: number): number =>  return x + y"
+  -- let userActionCodeTS = "function add(x: number, y: number): number { return x + y }"
+  let userActionCodeTS = "this.add = (x: number, y: number): number => { return x + y }"
   Right (Just transpiledRes) <- callDuktape transpilerCtx Nothing "compileTypeScript" [String userActionCodeTS]  -- TODO in duktape: consider taking [path, to, functionName] instead of (Maybe obj) here and in exposeFnDuktape
 
   let Success TSCompilerOutput{..} = fromJSON transpiledRes
+  when (diagnostics /= []) $ do
+      -- In reality this would get sent back from the API call, and e.g. displayed in the console:
+      putStrLn "/===== We got some errors or warnings from TS compiler =====\\"
+      printDiagnostics diagnostics
+      putStrLn "\\===========================================================/"
   putStrLn $ "    Niiiiiice: " <> T.unpack jsCode
 
   -- --------------------------------------------------------------------------
@@ -156,3 +195,19 @@ data TSCompilerDiagnostic =
       -- relatedInformation: undefined
     } deriving (Show, Eq, Ord, Generic)
 instance FromJSON TSCompilerDiagnostic
+
+
+-- ==========================================================================
+-- Boring stuff
+
+throwLeft :: Monad m=> Either String a -> m a
+throwLeft = either error return
+
+printDiagnostics :: [TSCompilerDiagnostic] -> IO ()
+printDiagnostics = mapM_ $ \TSCompilerDiagnostic{..} -> do
+    putStr ">> "
+    T.putStrLn messageText
+    case (start, length) of
+      (Just s, Just l) -> putStrLn $ "    ...at bytes "<>(show s)<>" - "<>(show $ l+s)
+      _ -> return ()
+
