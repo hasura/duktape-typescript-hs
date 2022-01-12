@@ -21,7 +21,7 @@ function compileTypeScript(code) {
     var customCompilerHost = {
         getSourceFile: function (name) {
             var sourceFile;
-            console.log("getSourceFile ".concat(name));
+            // console.log("getSourceFile ".concat(name));
             if (name === dummyInputFileName) {
                 sourceFile = code;  // The code we're trying to compile
             }
