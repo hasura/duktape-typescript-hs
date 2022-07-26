@@ -57,7 +57,6 @@ main = do
   transpilerCtx <- createOurFancyDuktapeCtx
   loadTypescriptCompiler transpilerCtx
 
-  say "Transpiling a typescript program to ES5 JS, using our new transpiler"
   -- This would be untrusted user code, e.g. entered into a REPL in the
   -- hasura console, meant to power an action. In reality the function might
   -- take an object of a certain type we expose to client code, and also return
@@ -68,8 +67,12 @@ main = do
   -- TODO (re above) understand "eval code" vs "program code": 
   --      https://github.com/svaarala/duktape/issues/163#issuecomment-89756195 
   --      Maybe extend duktape bindings, document.
+  say "Please enter a TS one-liner like:"
+  say "    this.add = (x: number, y: number): number => { return x + y }"
   -- let userActionCodeTS = "function add(x: number, y: number): number { return x + y }"
-  let userActionCodeTS = "this.add = (x: number, y: number): number => { return x + y }"
+  userActionCodeTS <- T.getLine
+  
+  say "Transpiling a typescript program to ES5 JS, using our new transpiler"
   Right (Just transpiledRes) <- callDuktape transpilerCtx Nothing "compileTypeScript" [String userActionCodeTS]  -- TODO in duktape: consider taking [path, to, functionName] instead of (Maybe obj) here and in exposeFnDuktape
 
   let Success TSCompilerOutput{..} = fromJSON transpiledRes
